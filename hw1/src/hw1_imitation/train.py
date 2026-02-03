@@ -20,7 +20,7 @@ from hw1_imitation.data import (
     load_pusht_zarr,
 )
 from hw1_imitation.model import build_policy, PolicyType
-from hw1_imitation.evaluation import Logger
+from hw1_imitation.evaluation import Logger, evaluate_policy
 
 LOGDIR_PREFIX = "exp"
 
@@ -31,7 +31,7 @@ class TrainConfig:
     data_dir: Path = Path("data")
 
     # The policy type -- either MSE or flow.
-    policy_type: PolicyType = "mse"
+    policy_type: PolicyType = "flow"
     # The number of denoising steps to use for the flow policy (has no effect for the MSE policy).
     flow_num_steps: int = 10
     # The action chunk size.
@@ -88,7 +88,13 @@ def config_to_dict(config: TrainConfig) -> dict[str, Any]:
 
 def run_training(config: TrainConfig) -> None:
     set_seed(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Use MPS (Metal) on Mac Silicon, CUDA on NVIDIA GPUs, otherwise CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
 
     zarr_path = download_pusht(config.data_dir)
@@ -118,6 +124,10 @@ def run_training(config: TrainConfig) -> None:
         hidden_dims=config.hidden_dims,
     ).to(device)
 
+    # only use compile if on cuda
+    if device.type == "cuda":
+        model = torch.compile(model)
+    
     exp_name = f"seed_{config.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if config.exp_name is not None:
         exp_name += f"_{config.exp_name}"
@@ -128,7 +138,38 @@ def run_training(config: TrainConfig) -> None:
     logger = Logger(log_dir)
 
     ### TODO: PUT YOUR MAIN TRAINING LOOP HERE ###
-
+    optimizer = torch.optim.Adam(model.parameters(), 
+                lr=config.lr, 
+                weight_decay=config.weight_decay)
+    step = 0
+    for epoch in range(config.num_epochs):
+        model.train()
+        for state, action_chunk in loader:
+            state = state.to(device)
+            action_chunk = action_chunk.to(device)
+            loss = model.compute_loss(state, action_chunk)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            step += 1
+            if step % config.log_interval == 0:
+                logger.log({
+                    "train/loss": loss.item(),
+                }, step=step)
+            if step % config.eval_interval == 0:
+                evaluate_policy(
+                    model=model,
+                    normalizer=normalizer,
+                    device=device,
+                    chunk_size=config.chunk_size,
+                    video_size=config.video_size,
+                    num_video_episodes=config.num_video_episodes,
+                    flow_num_steps=config.flow_num_steps,
+                    step=step,
+                    logger=logger,
+                )
+                model.train()
+    
     logger.dump_for_grading()
 
 
